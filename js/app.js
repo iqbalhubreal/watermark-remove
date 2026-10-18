@@ -10,7 +10,7 @@
   let cropMaskCanvas = document.createElement('canvas'), cropMaskCtx = cropMaskCanvas.getContext('2d', { willReadFrequently: true });
   let featherMaskCanvas = document.createElement('canvas'), featherMaskCtx = featherMaskCanvas.getContext('2d');
   let sourceCropCanvas = document.createElement('canvas'), sourceCropCtx = sourceCropCanvas.getContext('2d', { willReadFrequently: true });
-  let selectionBounds = null, currentTool = 'rectangle', exportCanvas = null, exportCtx = null, recorder = null, exportStream = null, recordedChunks = [], exportDuration = 0, exportAudioAvailable = false;
+  let selectionBounds = null, currentTool = 'rectangle', exportCanvas = null, exportCtx = null, recorder = null, exportStream = null, exportVideoTrack = null, recordedChunks = [], exportDuration = 0, exportAudioAvailable = false, recordingStartedAt = 0, recordedDurationMs = 0;
   let selectionRevision = 0, fillPlanCache = null;
   const brushCursor = $('brushCursor');
   let lastPointer = null, brushPreviewTimer = 0;
@@ -226,8 +226,18 @@
     // loop does not need to re-run the fill on an unchanged frame.
     if(video.paused&&!exporting)return;
     lastDraw=ts;
-    drawProcessed(ctx,canvas,true);
-    if(exporting&&exportCtx&&exportCanvas)drawProcessed(exportCtx,exportCanvas,false);
+    if(exporting&&exportCtx&&exportCanvas){
+      // Render only the export while recording. Running the expensive fill twice
+      // per frame (preview plus export) can starve decoding and make playback stutter.
+      drawProcessed(exportCtx,exportCanvas,false);
+      // In manual-capture mode, record only a newly rendered frame instead of
+      // repeatedly recording stale canvas frames while processing is busy.
+      if(exportVideoTrack&&typeof exportVideoTrack.requestFrame==='function'){
+        try{exportVideoTrack.requestFrame();}catch(e){}
+      }
+    }else{
+      drawProcessed(ctx,canvas,true);
+    }
     updateTransport();
   }
   function onMediaReady() {
@@ -318,6 +328,106 @@
   function setSettingsLocked(locked){['brushSize','blurAmount','featherAmount','fillPasses'].forEach(id=>{$(id).disabled=locked;});document.querySelectorAll('input[name="effect"]').forEach(el=>{el.disabled=locked;});$('clearSelectionBtn').disabled=locked||!hasSelection();}
   function stopExportUI(){exporting=false;setSettingsLocked(false);$('progressWrap').style.display='none';$('exportBtn').disabled=!hasMedia()||!hasSelection();$('changeFileBtn').disabled=false;$('playBtn').disabled=!hasVideo();$('seekBarWide').disabled=!hasVideo();canvas.style.cursor=cursorFor(currentTool);}
   function supportedMime(){if(!window.MediaRecorder)return'';const types=['video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm'];return types.find(t=>MediaRecorder.isTypeSupported(t))||'';}
+
+  // MediaRecorder WebM files can lack the Duration field that gallery apps use
+  // to report clip length. Add or update that EBML metadata without re-encoding.
+  async function fixWebmDuration(blob,durationMs){
+    if(!blob||!Number.isFinite(durationMs)||durationMs<=0)return blob;
+    try{
+      const buffer=typeof blob.arrayBuffer==='function'
+        ? await blob.arrayBuffer()
+        : await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result);reader.onerror=()=>reject(reader.error);reader.readAsArrayBuffer(blob);});
+      const bytes=new Uint8Array(buffer);
+      const readVint=(pos,isSize)=>{
+        if(pos<0||pos>=bytes.length)return null;
+        const first=bytes[pos];let length=1,marker=0x80;
+        while(length<=8&&(first&marker)===0){marker>>=1;length++;}
+        if(length>8||pos+length>bytes.length)return null;
+        let value=isSize?(first&(marker-1)):first;
+        for(let i=1;i<length;i++)value=value*256+bytes[pos+i];
+        return {value,length,unknown:isSize&&value===Math.pow(2,7*length)-1};
+      };
+      const elementAt=(pos,parentEnd)=>{
+        const id=readVint(pos,false);if(!id)return null;
+        const size=readVint(pos+id.length,true);if(!size)return null;
+        const dataStart=pos+id.length+size.length;
+        const end=size.unknown?parentEnd:dataStart+size.value;
+        if(end<dataStart||end>parentEnd)return null;
+        return {id:id.value,start:pos,sizeStart:pos+id.length,size,dataStart,end,unknown:size.unknown};
+      };
+      const concat=parts=>{
+        const total=parts.reduce((sum,part)=>sum+part.length,0),out=new Uint8Array(total);let offset=0;
+        for(const part of parts){out.set(part,offset);offset+=part.length;}
+        return out;
+      };
+      const encodeSize=(value,minLength)=>{
+        for(let length=Math.max(1,minLength||1);length<=8;length++){
+          if(value>Math.pow(2,7*length)-2)continue;
+          const out=new Uint8Array(length);let remaining=value;
+          for(let i=length-1;i>=0;i--){out[i]=remaining%256;remaining=Math.floor(remaining/256);}
+          out[0]|=1<<(8-length);return out;
+        }
+        return null;
+      };
+      let segment=null,cursor=0;
+      while(cursor<bytes.length){
+        const element=elementAt(cursor,bytes.length);if(!element)break;
+        if(element.id===0x18538067){segment=element;break;}
+        if(element.unknown||element.end<=cursor)break;
+        cursor=element.end;
+      }
+      if(!segment)return blob;
+      let info=null;cursor=segment.dataStart;
+      while(cursor<segment.end){
+        const element=elementAt(cursor,segment.end);if(!element)break;
+        if(element.id===0x1549A966){info=element;break;}
+        if(element.unknown||element.end<=cursor)break;
+        cursor=element.end;
+      }
+      if(!info)return blob;
+      let timecodeScale=1000000,durationElement=null;cursor=info.dataStart;
+      while(cursor<info.end){
+        const element=elementAt(cursor,info.end);if(!element)break;
+        if(element.id===0x2AD7B1&&element.end>element.dataStart){
+          let scale=0;for(let i=element.dataStart;i<element.end;i++)scale=scale*256+bytes[i];
+          if(Number.isFinite(scale)&&scale>0)timecodeScale=scale;
+        }else if(element.id===0x4489){durationElement=element;}
+        if(element.unknown||element.end<=cursor)break;
+        cursor=element.end;
+      }
+      const durationValue=durationMs*1000000/timecodeScale;
+      if(!Number.isFinite(durationValue)||durationValue<=0)return blob;
+      if(durationElement){
+        const patched=bytes.slice(),size=durationElement.end-durationElement.dataStart;
+        const view=new DataView(patched.buffer,patched.byteOffset+durationElement.dataStart,size);
+        if(size===4)view.setFloat32(0,durationValue,false);
+        else if(size===8)view.setFloat64(0,durationValue,false);
+        else return blob;
+        return new Blob([patched],{type:blob.type||'video/webm'});
+      }
+      // An EBML float64 is encoded as ID 0x4489, size 8, then eight data bytes.
+      const durationElementBytes=new Uint8Array(11);durationElementBytes[0]=0x44;durationElementBytes[1]=0x89;durationElementBytes[2]=0x88;
+      new DataView(durationElementBytes.buffer).setFloat64(3,durationValue,false);
+      const infoPayload=concat([bytes.slice(info.dataStart,info.end),durationElementBytes]);
+      const encodedInfoSize=encodeSize(infoPayload.length,info.size.length);if(!encodedInfoSize)return blob;
+      const infoBytes=concat([bytes.slice(info.start,info.sizeStart),encodedInfoSize,infoPayload]);
+      const delta=infoBytes.length-(info.end-info.start);
+      if(segment.unknown){
+        return new Blob([bytes.slice(0,info.start),infoBytes,bytes.slice(info.end)],{type:blob.type||'video/webm'});
+      }
+      const encodedSegmentSize=encodeSize(segment.size.value+delta,segment.size.length);if(!encodedSegmentSize)return blob;
+      const segmentHeader=concat([bytes.slice(segment.start,segment.sizeStart),encodedSegmentSize]);
+      const repaired=concat([
+        bytes.slice(0,segment.start),segmentHeader,bytes.slice(segment.dataStart,info.start),
+        infoBytes,bytes.slice(info.end,segment.end),bytes.slice(segment.end)
+      ]);
+      return new Blob([repaired],{type:blob.type||'video/webm'});
+    }catch(err){
+      // A metadata repair must never discard an otherwise usable recording.
+      return blob;
+    }
+  }
+
   $('exportBtn').addEventListener('click',async()=>{
     if(!hasMedia()||!hasSelection()||exporting)return;
     if(hasImage()){
@@ -338,16 +448,27 @@
     $('progressWrap').style.display='grid';setProgress(0,'Preparing video…');$('exportBtn').disabled=true;$('changeFileBtn').disabled=true;$('playBtn').disabled=true;$('seekBarWide').disabled=true;canvas.style.cursor='wait';updateBrushCursor(null);setSettingsLocked(true);$('cancelExportBtn').style.display='';
     try{
       exportCanvas=document.createElement('canvas');exportCanvas.width=video.videoWidth;exportCanvas.height=video.videoHeight;exportCtx=exportCanvas.getContext('2d');drawProcessed(exportCtx,exportCanvas,false);
-      const vStream=exportCanvas.captureStream(30);let audioTracks=[];
+      // Capture frames on demand where supported. A fixed 30 fps stream can
+      // duplicate stale frames if the inpainting step takes longer than 33 ms.
+      let vStream=exportCanvas.captureStream(0);
+      exportVideoTrack=vStream.getVideoTracks()[0]||null;
+      if(!exportVideoTrack||typeof exportVideoTrack.requestFrame!=='function'){
+        vStream.getTracks().forEach(t=>{try{t.stop();}catch(e){}});
+        vStream=exportCanvas.captureStream(30);
+        exportVideoTrack=vStream.getVideoTracks()[0]||null;
+      }
+      let audioTracks=[];
       try{const capture=typeof video.captureStream==='function'?video.captureStream():(typeof video.mozCaptureStream==='function'?video.mozCaptureStream():null);if(capture)audioTracks=capture.getAudioTracks();}catch(err){audioTracks=[];}
       exportAudioAvailable=audioTracks.length>0;exportStream=new MediaStream([...vStream.getVideoTracks(),...audioTracks]);
       recorder=new MediaRecorder(exportStream,{mimeType:mime,videoBitsPerSecond:Math.min(12000000,Math.max(2500000,video.videoWidth*video.videoHeight*4))});
       recorder.ondataavailable=e=>{if(e.data&&e.data.size)recordedChunks.push(e.data);};
       recorder.onerror=()=>{setStatus('The browser encountered an error while recording. Try a shorter or smaller video.','error');try{recorder.stop();}catch(e){finishExportCleanup();}};
-      recorder.onstop=()=>{
+      recorder.onstop=async()=>{
         try{
           if(!recordedChunks.length){setStatus('No video data was recorded. Try another browser or video format.','error');return;}
-          const blob=new Blob(recordedChunks,{type:mime}),out=URL.createObjectURL(blob),a=document.createElement('a'),base=(currentFile?.name||'video').replace(/\.[^.]+$/,'').replace(/[\\/:*?"<>|]+/g,'_');
+          const rawBlob=new Blob(recordedChunks,{type:mime});
+          const blob=await fixWebmDuration(rawBlob,recordedDurationMs||exportDuration*1000);
+          const out=URL.createObjectURL(blob),a=document.createElement('a'),base=(currentFile?.name||'video').replace(/\.[^.]+$/,'').replace(/[\\/:*?"<>|]+/g,'_');
           a.href=out;a.download=base+'-cleaned.webm';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(out),60000);
           setStatus(`Export complete. Saved ${a.download}.${exportAudioAvailable?' Audio was included when available.':' The browser did not expose an audio track, so this export may be silent.'}`,'success');
         }catch(err){setStatus('The video was recorded but could not be downloaded automatically. Check your browser downloads.','error');}
@@ -357,19 +478,45 @@
       if(video.currentTime>0.01){await new Promise(resolve=>{const done=()=>resolve();video.addEventListener('seeked',done,{once:true});video.currentTime=0;});}
       else video.currentTime=0;
       if(video.readyState<2)await new Promise((resolve,reject)=>{const ready=()=>{clean();resolve();},fail=()=>{clean();reject(new Error('Video was not ready'));},clean=()=>{video.removeEventListener('canplay',ready);video.removeEventListener('error',fail);};video.addEventListener('canplay',ready,{once:true});video.addEventListener('error',fail,{once:true});});
-      drawProcessed(exportCtx,exportCanvas,false);recorder.start(250);setProgress(1,'Recording processed video…');
+      drawProcessed(exportCtx,exportCanvas,false);
+      // Track the active recording time for WebM duration metadata.
+      recordingStartedAt=performance.now();recordedDurationMs=0;
+      // Avoid small MediaRecorder timeslices and let the browser finalize one recording.
+      recorder.start();setProgress(1,'Recording processed video…');
       const progressTimer=setInterval(()=>{if(!exporting){clearInterval(progressTimer);return;}const pct=exportDuration>0?Math.min(99,(video.currentTime/exportDuration)*100):0;setProgress(pct,`Recording… ${fmtTime(video.currentTime)} / ${fmtTime(exportDuration)}`);},250);
       const rec=recorder;let hiddenPause=false;
       // Draw one last frame and give the recorder a moment to receive it before stopping.
-      const ended=()=>{clearInterval(progressTimer);if(exportCtx&&exportCanvas)drawProcessed(exportCtx,exportCanvas,false);setTimeout(()=>{if(rec.state!=='inactive')rec.stop();},150);};
+      const ended=()=>{
+        clearInterval(progressTimer);
+        if(recordingStartedAt){recordedDurationMs+=performance.now()-recordingStartedAt;recordingStartedAt=0;}
+        if(exportCtx&&exportCanvas){
+          drawProcessed(exportCtx,exportCanvas,false);
+          if(exportVideoTrack&&typeof exportVideoTrack.requestFrame==='function'){
+            try{exportVideoTrack.requestFrame();}catch(e){}
+          }
+        }
+        // Allow the final captured frame to reach the encoder before finalizing.
+        setTimeout(()=>{if(rec.state!=='inactive')rec.stop();},250);
+      };
       // If playback is interrupted (media key, OS, etc.) resume it rather than hanging forever.
       const onPause=()=>{if(!exporting||hiddenPause||video.ended)return;if(Number.isFinite(video.duration)&&video.currentTime>=video.duration-0.15)return;video.play().catch(()=>abortExport('Playback was interrupted, so the export was stopped. Nothing was saved.'));};
       const onVideoError=()=>abortExport('The video failed during export, so the export was stopped. Nothing was saved.');
       // Browsers stop animation frames in a hidden tab, which would record frozen frames. Pause until it is visible again.
       const onVisibility=()=>{
         if(!exporting)return;
-        if(document.hidden){hiddenPause=true;video.pause();if(rec.state==='recording')rec.pause();setStatus('Export paused while this tab is hidden. Return to this tab to continue.');}
-        else if(hiddenPause){hiddenPause=false;if(rec.state==='paused')rec.resume();setStatus('Recording processed video…');video.play().catch(()=>abortExport('Playback could not resume, so the export was stopped. Nothing was saved.'));}
+        if(document.hidden){
+          hiddenPause=true;video.pause();
+          if(rec.state==='recording'){
+            if(recordingStartedAt){recordedDurationMs+=performance.now()-recordingStartedAt;recordingStartedAt=0;}
+            rec.pause();
+          }
+          setStatus('Export paused while this tab is hidden. Return to this tab to continue.');
+        }else if(hiddenPause){
+          hiddenPause=false;
+          if(rec.state==='paused'){recordingStartedAt=performance.now();rec.resume();}
+          setStatus('Recording processed video…');
+          video.play().catch(()=>abortExport('Playback could not resume, so the export was stopped. Nothing was saved.'));
+        }
       };
       video.addEventListener('ended',ended,{once:true});video.addEventListener('pause',onPause);video.addEventListener('error',onVideoError);document.addEventListener('visibilitychange',onVisibility);
       window.__localWatermarkExportCleanup=()=>{clearInterval(progressTimer);video.removeEventListener('ended',ended);video.removeEventListener('pause',onPause);video.removeEventListener('error',onVideoError);document.removeEventListener('visibilitychange',onVisibility);};
@@ -382,7 +529,7 @@
     // Detach the recorder first so a late stop event cannot overwrite the status or trigger a download.
     if(recorder){const r=recorder;r.ondataavailable=null;r.onerror=null;if(r.state!=='inactive'){r.onstop=null;try{r.stop();}catch(e){}}}
     try{if(!video.paused&&!video.ended)video.pause();}catch(e){}
-    if(exportStream){exportStream.getTracks().forEach(t=>{try{t.stop();}catch(e){}});exportStream=null;}recorder=null;exportCanvas=null;exportCtx=null;recordedChunks=[];stopExportUI();updateTransport();if(hasMedia())drawProcessed(ctx,canvas,true);setProgress(100,'Finished');}
+    if(exportStream){exportStream.getTracks().forEach(t=>{try{t.stop();}catch(e){}});exportStream=null;}exportVideoTrack=null;recordingStartedAt=0;recordedDurationMs=0;recorder=null;exportCanvas=null;exportCtx=null;recordedChunks=[];stopExportUI();updateTransport();if(hasMedia())drawProcessed(ctx,canvas,true);setProgress(100,'Finished');}
   window.addEventListener('watermark-wasm-ready',()=>{setFillStatus('Bundled WebAssembly fill is ready. Your media stays on this device.');if(hasMedia()&&activeEffect()==='remove')drawProcessed(ctx,canvas,true);});
   if(window.LocalWatermarkWasm&&window.LocalWatermarkWasm.isReady())setFillStatus('Bundled WebAssembly fill is ready. Your media stays on this device.');
   $('fillPassesValue').textContent=$('fillPasses').value+' passes';showEffectControls();setTool('rectangle');updateSelectionUI();rafId=requestAnimationFrame(renderLoop);
